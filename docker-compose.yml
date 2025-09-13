@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  video-worker:
+    build: .
+    ports:
+      - "8081:8080"
+    env_file:
+      - .env
+    environment:
+      - PORT=8080
+    volumes:
+      - ./logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    container_name: video-worker
