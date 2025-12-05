@@ -51,10 +51,19 @@ cp .env.example .env
 
 # 3) Build & run
 docker build -t video-worker .
+
+# Development (port 8080):
 docker run --env-file .env -p 8080:8080 --name video-worker video-worker
 
+# Production (port 8081 external, 8080 internal):
+docker run --env-file .env -p 8081:8080 --name video-worker video-worker
+
+# Or use docker-compose (recommended for production):
+docker compose up -d
+```
+
 ```bash
-# 4) Test
+# 4) Test (adjust port based on deployment)
 curl -F "video=@/path/to/input.mov" http://localhost:8080/transcode
 
 # 5) Test logging system (creates mock log entries)
@@ -70,10 +79,34 @@ curl http://localhost:8080/stats
 
 - `PINATA_JWT` (required) — Create in Pinata Dashboard → API Keys (JWT).
 - `PINATA_GATEWAY` (optional) — Defaults to `https://gateway.pinata.cloud/ipfs`.
-- `MAX_UPLOAD_MB` (optional) — Upload limit, default `512`.
+- `MAX_UPLOAD_MB` (optional) — Upload limit, default `512` (set to `200` on Mac Mini M4).
 - `X264_PRESET`, `X264_CRF`, `AAC_BITRATE` — FFmpeg tuning knobs.
+- `PORT` (optional) — Internal port, defaults to `8080`.
 - CORS is open to all origins by default.
 - `NODE_ENV` — Environment mode (`development` or `production`).
+
+## Production Deployment (Mac Mini M4)
+
+**Current Live Configuration:**
+
+- **External URL:** `https://minivlad.tail9656d3.ts.net/video/transcode`
+- **External Port:** `8081`
+- **Internal Port:** `8080`
+- **Container:** `video-worker`
+- **Upload Limit:** `200MB`
+- **Network:** Tailscale Funnel (publicly accessible)
+
+**Port Mapping:**
+```yaml
+# docker-compose.yml
+ports:
+  - "8081:8080"  # Host:Container
+```
+
+This means:
+- Service listens on port `8080` inside the container
+- Accessible on port `8081` from the host (Mac Mini)
+- Tailscale Funnel routes `https://minivlad.tail9656d3.ts.net/video/*` to port `8081`
 
 ## Deploy Options
 
