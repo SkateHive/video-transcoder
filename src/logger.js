@@ -210,7 +210,8 @@ class TranscodeLogger {
             userHP: log.userHP,
             correlationId: log.correlationId,
             viewport: log.viewport,
-            connectionType: log.connectionType
+            connectionType: log.connectionType,
+            node: log.node
         }));
     }
 
