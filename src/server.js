@@ -250,7 +250,7 @@ app.post('/transcode', upload.single('video'), async (req, res) => {
         requestId,
         platform,
         deviceInfo: deviceDetails,
-        userHP: userHP.toString(),
+        userHP: userHP ? userHP.toString() : '',
         clientIP: clientIP.substring(0, 20), // truncated for privacy
         ...(thumbnail ? { thumbnail } : {})
       }
