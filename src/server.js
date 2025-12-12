@@ -170,14 +170,16 @@ app.post('/transcode', upload.single('video'), async (req, res) => {
 
   // Extract rich user information from form data
   // Get rich user data from form (with backward compatibility)
-  const creator = req.body.creator || req.body.user || 'anonymous';
-  const platform = req.body.platform || 'unknown';
-  const deviceInfo = req.body.deviceInfo || '';
-  const browserInfo = req.body.browserInfo || '';
-  const userHP = req.body.userHP || null;
-  const correlationId = req.body.correlationId || null;
-  const viewport = req.body.viewport || null;
-  const connectionType = req.body.connectionType || null;  // Parse device info from User-Agent if not provided
+  // req.body may be undefined if multer didn't parse the request (e.g. wrong content-type)
+  const body = req.body || {};
+  const creator = body.creator || body.user || 'anonymous';
+  const platform = body.platform || 'unknown';
+  const deviceInfo = body.deviceInfo || '';
+  const browserInfo = body.browserInfo || '';
+  const userHP = body.userHP || null;
+  const correlationId = body.correlationId || null;
+  const viewport = body.viewport || null;
+  const connectionType = body.connectionType || null;  // Parse device info from User-Agent if not provided
   const deviceDetails = parseDeviceInfo(userAgent, deviceInfo);
 
   // Log transcode start
