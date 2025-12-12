@@ -9,6 +9,7 @@ services:
       - .env
     environment:
       - PORT=8080
+      - NODE_NAME=${NODE_NAME:-macmini}
     volumes:
       - ./logs:/app/logs
     restart: unless-stopped

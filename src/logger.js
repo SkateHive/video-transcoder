@@ -1,12 +1,17 @@
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 
 class TranscodeLogger {
-    constructor(logFilePath = 'logs/transcode.log', maxLogs = 100) {
-        this.logFilePath = logFilePath;
+    constructor(logFilePath = null, maxLogs = 100) {
+        // Use NODE_NAME env var for unique log files, fallback to hostname
+        const nodeName = process.env.NODE_NAME || os.hostname().split('.')[0];
+        this.nodeName = nodeName;
+        this.logFilePath = logFilePath || `logs/transcode-${nodeName}.log`;
         this.maxLogs = maxLogs;
         this.logs = [];
         this.loadLogs();
+        console.log(`📝 Logger initialized for node: ${nodeName}`);
     }
 
     loadLogs() {
@@ -46,7 +51,8 @@ class TranscodeLogger {
         const enrichedLog = {
             ...logEntry,
             timestamp: new Date().toISOString(),
-            id: logEntry.id || 'unknown'
+            id: logEntry.id || 'unknown',
+            node: this.nodeName
         };
 
         this.logs.push(enrichedLog);
@@ -60,7 +66,7 @@ class TranscodeLogger {
         const emoji = this.getStatusEmoji(log.status);
         const duration = log.duration ? `${log.duration}ms` : 'N/A';
 
-        console.log(`${emoji} [${log.timestamp}] ${log.status.toUpperCase()}`);
+        console.log(`${emoji} [${log.timestamp}] [${log.node || 'unknown'}] ${log.status.toUpperCase()}`);
         console.log(`   🆔 ID: ${log.id}`);
         console.log(`   👤 User: ${log.user || 'anonymous'}${log.userHP ? ` (HP: ${log.userHP})` : ''}`);
         console.log(`   📁 File: ${log.filename || 'unknown'} (${log.fileSize || 0} bytes)`);
