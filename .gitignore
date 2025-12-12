@@ -2,3 +2,6 @@
 .env
 
 node_modules
+# Logs (generated per-node, should not be tracked)
+logs/
+*.log
