@@ -6,6 +6,7 @@ A tiny API that accepts a file upload, transcodes it to MP4 (H.264/AAC) with FFm
 
 - `GET /healthz` — health check
 - `POST /transcode` — multipart/form-data with a single field named `video`
+- `GET /progress/:requestId` — **SSE (Server-Sent Events)** for real-time progress streaming
 - `GET /logs` — get recent transcode operations (JSON)
 - `GET /stats` — get transcoding statistics (JSON)
 
@@ -18,6 +19,61 @@ A tiny API that accepts a file upload, transcodes it to MP4 (H.264/AAC) with FFm
     "gatewayUrl": "https://gateway.pinata.cloud/ipfs/bafy..."
   }
 }
+```
+
+## 🆕 Real-Time Progress Streaming (SSE)
+
+The service now supports **Server-Sent Events (SSE)** for real-time progress updates during transcoding:
+
+### How It Works
+
+1. **Client generates a unique `correlationId`** before uploading
+2. **Client opens SSE connection** to `/progress/:correlationId`
+3. **Client sends POST to `/transcode`** with the same `correlationId` in form data
+4. **Server broadcasts progress** to all connected SSE clients for that request
+
+### Progress Stages
+
+| Stage | Progress Range | Description |
+|-------|---------------|-------------|
+| `waiting` | 0% | SSE connected, waiting for upload |
+| `receiving` | 5% | Server receiving file |
+| `transcoding` | 10-80% | FFmpeg processing (based on video duration) |
+| `uploading` | 80-100% | Uploading to Pinata IPFS |
+| `complete` | 100% | Done! |
+| `error` | 0% | Something went wrong |
+
+### SSE Client Example
+
+```javascript
+// Generate unique ID
+const requestId = `${Date.now().toString(36)}-${Math.random().toString(36).substr(2, 6)}`;
+
+// Open SSE connection BEFORE uploading
+const eventSource = new EventSource(`https://server/progress/${requestId}`);
+eventSource.onmessage = (event) => {
+  const { progress, stage } = JSON.parse(event.data);
+  console.log(`Progress: ${progress}% - ${stage}`);
+  updateProgressBar(progress);
+};
+
+// Send upload with correlationId
+const formData = new FormData();
+formData.append('video', file);
+formData.append('correlationId', requestId);
+fetch('https://server/transcode', { method: 'POST', body: formData });
+```
+
+### Terminal Test
+
+```bash
+# Test SSE progress with curl
+TEST_ID="test-$(date +%s)" && \
+(curl -sN "https://minivlad.tail9656d3.ts.net/video/progress/$TEST_ID" &) && \
+sleep 1 && \
+curl -X POST "https://minivlad.tail9656d3.ts.net/video/transcode" \
+  -F "video=@/path/to/video.mov" \
+  -F "correlationId=$TEST_ID"
 ```
 
 ## Logging & Monitoring
