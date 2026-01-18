@@ -69,9 +69,9 @@ fetch('https://server/transcode', { method: 'POST', body: formData });
 ```bash
 # Test SSE progress with curl
 TEST_ID="test-$(date +%s)" && \
-(curl -sN "https://minivlad.tail9656d3.ts.net/video/progress/$TEST_ID" &) && \
+(curl -sN "https://minivlad.tail83ea3e.ts.net/video/progress/$TEST_ID" &) && \
 sleep 1 && \
-curl -X POST "https://minivlad.tail9656d3.ts.net/video/transcode" \
+curl -X POST "https://minivlad.tail83ea3e.ts.net/video/transcode" \
   -F "video=@/path/to/video.mov" \
   -F "correlationId=$TEST_ID"
 ```
@@ -145,7 +145,7 @@ curl http://localhost:8080/stats
 
 **Current Live Configuration:**
 
-- **External URL:** `https://minivlad.tail9656d3.ts.net/video/transcode`
+- **External URL:** `https://minivlad.tail83ea3e.ts.net/video/transcode`
 - **External Port:** `8081`
 - **Internal Port:** `8080`
 - **Container:** `video-worker`
@@ -162,7 +162,7 @@ ports:
 This means:
 - Service listens on port `8080` inside the container
 - Accessible on port `8081` from the host (Mac Mini)
-- Tailscale Funnel routes `https://minivlad.tail9656d3.ts.net/video/*` to port `8081`
+- Tailscale Funnel routes `https://minivlad.tail83ea3e.ts.net/video/*` to port `8081`
 
 ## Deploy Options
 
