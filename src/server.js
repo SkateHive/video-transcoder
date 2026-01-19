@@ -256,20 +256,35 @@ app.post('/transcode', upload.single('video'), async (req, res) => {
   const origin = req.get('Origin') || req.get('Referer') || 'direct';
 
   // Extract rich user information from form data
-  // Get rich user data from form (with backward compatibility)
+  // ALL FIELDS ARE OPTIONAL for backward compatibility with older app versions
   // req.body may be undefined if multer didn't parse the request (e.g. wrong content-type)
   const body = req.body || {};
+  
+  // Core fields (with fallbacks)
   const creator = body.creator || body.user || 'anonymous';
+  
+  // SOURCE APP TRACKING - Critical for analytics
+  // Values: 'webapp' | 'mobile' | 'unknown'
+  // Mobile app sends 'mobile', webapp sends 'webapp'
+  const sourceApp = body.source_app || body.sourceApp || 'unknown';
+  
+  // App version tracking (optional)
+  const appVersion = body.app_version || body.appVersion || '';
+  
+  // Platform details (optional)
   const platform = body.platform || 'unknown';
   const deviceInfo = body.deviceInfo || '';
   const browserInfo = body.browserInfo || '';
   const userHP = body.userHP || null;
+  
   // Use client's correlationId for SSE progress (so client can subscribe before request)
   // Fall back to internal ID if not provided
   const correlationId = body.correlationId || null;
   const requestId = correlationId || internalId; // Use correlationId for SSE progress!
   const viewport = body.viewport || null;
-  const connectionType = body.connectionType || null;  // Parse device info from User-Agent if not provided
+  const connectionType = body.connectionType || null;
+  
+  // Parse device info from User-Agent if not provided
   const deviceDetails = parseDeviceInfo(userAgent, deviceInfo);
   
   console.log(`🔗 Request ID for SSE: ${requestId} (correlationId: ${correlationId || 'none'})`);
@@ -278,6 +293,8 @@ app.post('/transcode', upload.single('video'), async (req, res) => {
   logger.logTranscodeStart({
     id: requestId,
     user: creator,
+    sourceApp,
+    appVersion,
     filename: req.file?.originalname || 'unknown',
     fileSize: req.file?.size || 0,
     clientIP,
@@ -350,10 +367,13 @@ app.post('/transcode', upload.single('video'), async (req, res) => {
     form.append('file', fs.createReadStream(outputPath), { filename: outName, contentType: 'video/mp4' });
 
     // Pinata metadata with rich keyvalues
+    // All values stored for analytics and debugging
     const metadata = {
-      name: `transcoded-${new Date().toISOString()}.mp4`,
+      name: `${sourceApp}-${creator}-${new Date().toISOString()}.mp4`,
       keyvalues: {
         creator,
+        source_app: sourceApp,        // 'webapp' | 'mobile' | 'unknown'
+        app_version: appVersion,       // e.g., '1.2.3' or ''
         requestId,
         platform,
         deviceInfo: deviceDetails,
@@ -413,6 +433,7 @@ app.post('/transcode', upload.single('video'), async (req, res) => {
       requestId,
       duration: totalDuration,
       creator,
+      sourceApp,
       timestamp: new Date().toISOString()
     });
 
