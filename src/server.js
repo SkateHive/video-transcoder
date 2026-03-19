@@ -64,7 +64,8 @@ app.use((req, res, next) => {
 
 const PORT = process.env.PORT || 8080;
 const PINATA_JWT = process.env.PINATA_JWT;
-const PINATA_GATEWAY = process.env.PINATA_GATEWAY || 'https://gateway.pinata.cloud/ipfs';
+const PINATA_GATEWAY = process.env.PINATA_GATEWAY || 'https://ipfs.skatehive.app/ipfs';
+const PINATA_GROUP_VIDEOS = process.env.PINATA_GROUP_VIDEOS || null;
 
 if (!PINATA_JWT) {
   console.warn('⚠️  PINATA_JWT is not set. Set it in your environment before starting.');
@@ -366,25 +367,47 @@ app.post('/transcode', upload.single('video'), async (req, res) => {
     const form = new FormData();
     form.append('file', fs.createReadStream(outputPath), { filename: outName, contentType: 'video/mp4' });
 
-    // Pinata metadata with rich keyvalues
-    // All values stored for analytics and debugging
+    // Pinata metadata with rich keyvalues (standardized schema matching webapp)
+    const uploadDate = new Date().toISOString();
     const metadata = {
-      name: `${sourceApp}-${creator}-${new Date().toISOString()}.mp4`,
+      name: `${creator}-${uploadDate}.mp4`,
       keyvalues: {
+        // Core identity (webapp-compatible)
         creator,
-        source_app: sourceApp,        // 'webapp' | 'mobile' | 'unknown'
-        app_version: appVersion,       // e.g., '1.2.3' or ''
+        source: 'video-worker',
+        fileType: 'video/mp4',
+        uploadDate,
+        
+        // Transcoding metadata
+        transcoded: 'true',
+        originalFileName: req.file.originalname,
+        videoDuration: videoDuration ? videoDuration.toString() : 'unknown',
         requestId,
+        
+        // Device/platform tracking
         platform,
+        sourceApp,                     // 'webapp' | 'mobile' | 'unknown'
+        appVersion,                    // e.g., '1.2.3' or ''
         deviceInfo: deviceDetails,
-        userHP: userHP ? userHP.toString() : '',
+        browserInfo,
+        userAgent: userAgent.substring(0, 100),
+        ...(viewport && { viewport }),
+        ...(connectionType && { connectionType }),
+        
+        // User context
+        ...(userHP && { userHP: userHP.toString() }),
         clientIP: clientIP.substring(0, 20), // truncated for privacy
-        ...(thumbnail ? { thumbnail } : {})
+        
+        // Optional
+        ...(thumbnail && { thumbnailUrl: thumbnail })
       }
     };
     form.append('pinataMetadata', JSON.stringify(metadata));
 
-    const options = { cidVersion: 1 };
+    const options = {
+      cidVersion: 1,
+      ...(PINATA_GROUP_VIDEOS && { groupId: PINATA_GROUP_VIDEOS })
+    };
     form.append('pinataOptions', JSON.stringify(options));
 
     broadcastProgress(requestId, 85, 'uploading');
