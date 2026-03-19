@@ -368,37 +368,23 @@ app.post('/transcode', upload.single('video'), async (req, res) => {
     form.append('file', fs.createReadStream(outputPath), { filename: outName, contentType: 'video/mp4' });
 
     // Pinata metadata with rich keyvalues (standardized schema matching webapp)
+    // NOTE: Pinata limits to max 10 keyvalues - prioritize most important fields
     const uploadDate = new Date().toISOString();
     const metadata = {
       name: `${creator}-${uploadDate}.mp4`,
       keyvalues: {
-        // Core identity (webapp-compatible)
+        // Core identity (webapp-compatible) - 7 fields
         creator,
         source: 'video-worker',
-        fileType: 'video/mp4',
         uploadDate,
-        
-        // Transcoding metadata
         transcoded: 'true',
         originalFileName: req.file.originalname,
         videoDuration: videoDuration ? videoDuration.toString() : 'unknown',
         requestId,
         
-        // Device/platform tracking
-        platform,
-        sourceApp,                     // 'webapp' | 'mobile' | 'unknown'
-        appVersion,                    // e.g., '1.2.3' or ''
-        deviceInfo: deviceDetails,
-        browserInfo,
-        userAgent: userAgent.substring(0, 100),
-        ...(viewport && { viewport }),
-        ...(connectionType && { connectionType }),
-        
-        // User context
-        ...(userHP && { userHP: userHP.toString() }),
-        clientIP: clientIP.substring(0, 20), // truncated for privacy
-        
-        // Optional
+        // Device/platform tracking - up to 3 more fields (10 total max)
+        ...(sourceApp && { sourceApp }),  // webapp/mobile
+        ...(platform && { platform }),    // mobile/desktop
         ...(thumbnail && { thumbnailUrl: thumbnail })
       }
     };
@@ -465,6 +451,14 @@ app.post('/transcode', upload.single('video'), async (req, res) => {
 
     // Broadcast error to SSE clients
     broadcastProgress(requestId, 0, 'error');
+
+    // Enhanced error logging for debugging Pinata issues
+    console.error('❌ [PINATA-ERROR] Full error details:', {
+      message: err.message,
+      response: err.response?.data,
+      status: err.response?.status,
+      headers: err.response?.headers
+    });
 
     // Log error
     logger.logTranscodeError({
