@@ -14,6 +14,61 @@ import TranscodeLogger from './logger.js';
 const app = express();
 const logger = new TranscodeLogger();
 
+/**
+ * Check if video is web-optimized (H.264/AAC, faststart, reasonable size)
+ * Returns { optimized: boolean, reason?: string, videoInfo?: object }
+ */
+async function checkWebOptimized(inputPath) {
+  return new Promise((resolve) => {
+    const proc = spawn('ffprobe', [
+      '-v', 'quiet',
+      '-print_format', 'json',
+      '-show_format',
+      '-show_streams',
+      inputPath
+    ]);
+
+    let stdout = '';
+    proc.stdout.on('data', (d) => { stdout += d.toString(); });
+    proc.on('close', (code) => {
+      if (code !== 0) {
+        return resolve({ optimized: false, reason: 'ffprobe failed' });
+      }
+
+      try {
+        const info = JSON.parse(stdout);
+        const videoStream = info.streams.find(s => s.codec_type === 'video');
+        const audioStream = info.streams.find(s => s.codec_type === 'audio');
+
+        if (!videoStream || videoStream.codec_name !== 'h264') {
+          return resolve({ optimized: false, reason: `video codec: ${videoStream?.codec_name || 'none'}` });
+        }
+
+        if (audioStream && audioStream.codec_name !== 'aac') {
+          return resolve({ optimized: false, reason: `audio codec: ${audioStream.codec_name}` });
+        }
+
+        const height = parseInt(videoStream.height);
+        if (height > 1080) {
+          return resolve({ optimized: false, reason: `resolution too high: ${height}p` });
+        }
+
+        resolve({
+          optimized: true,
+          videoInfo: {
+            codec: videoStream.codec_name,
+            resolution: `${videoStream.width}x${videoStream.height}`,
+            duration: parseFloat(info.format.duration),
+            bitrate: parseInt(info.format.bit_rate)
+          }
+        });
+      } catch (err) {
+        resolve({ optimized: false, reason: 'parse error' });
+      }
+    });
+  });
+}
+
 // Store active transcoding progress for SSE clients
 const activeJobs = new Map(); // requestId -> { progress, stage, clients: Set<Response> }
 
@@ -74,11 +129,36 @@ if (!PINATA_JWT) {
 // Morgan logging for HTTP requests
 app.use(morgan('combined'));
 
-// Morgan logging for HTTP requests
-app.use(morgan('combined'));
+// Helper to detect browser requests
+const wantsHtml = (req) => String(req.headers.accept || '').includes('text/html');
+
+// Health check with HTML support for browsers
+const sendHealth = (req, res, payload, title) => {
+  if (wantsHtml(req)) {
+    const html = [
+      '<!doctype html>',
+      '<html>',
+      `  <head><meta charset="utf-8"><title>${title}</title></head>`,
+      '  <body style="font-family: system-ui; padding: 2rem; max-width: 600px; margin: 0 auto;">',
+      `    <h1 style="color: #32cd32;">🎬 ${title}</h1>`,
+      `    <p><strong>Status:</strong> ${payload.ok ? '✅ Healthy' : '❌ Error'}</p>`,
+      `    <p><strong>Service:</strong> ${payload.service || 'video-worker'}</p>`,
+      `    <p><strong>Timestamp:</strong> ${payload.timestamp}</p>`,
+      '  </body>',
+      '</html>'
+    ].join('\n');
+    res.type('html').send(html);
+    return;
+  }
+  res.json(payload);
+};
+
 app.get('/', (_req, res) => res.send('🎬 Video Worker - Ready for transcoding!'));
 app.head('/', (_req, res) => res.sendStatus(200));
-app.get('/healthz', (_req, res) => res.json({ ok: true, service: 'video-worker', timestamp: new Date().toISOString() }));
+app.get('/healthz', (req, res) => {
+  const payload = { ok: true, service: 'video-worker', timestamp: new Date().toISOString() };
+  sendHealth(req, res, payload, 'Video Worker Health');
+});
 
 // SSE endpoint for progress streaming
 app.get('/progress/:requestId', (req, res) => {
@@ -324,8 +404,11 @@ app.post('/transcode', upload.single('video'), async (req, res) => {
   }
 
   const inputPath = req.file.path;
-  const outName = `${uuidv4()}.mp4`;
-  const outputPath = path.join(os.tmpdir(), outName);
+  const fileName = req.file.originalname;
+  const fileSize = req.file.size;
+  let outputPath = null;
+  let needsTranscoding = false;
+  let videoDuration = 0;
 
   // Initialize job tracking for SSE - PRESERVE existing clients if SSE connected first!
   const existingJob = activeJobs.get(requestId);
@@ -335,26 +418,62 @@ app.post('/transcode', upload.single('video'), async (req, res) => {
   broadcastProgress(requestId, 5, 'receiving');
 
   try {
-    // Get video duration for progress calculation
-    const videoDuration = await getVideoDuration(inputPath);
-    console.log(`📏 Video duration: ${videoDuration}s`);
-    
-    broadcastProgress(requestId, 10, 'transcoding');
-    
-    // Transcode to a broadly compatible H.264/AAC MP4
-    const ffArgs = [
-      '-y',
-      '-i', inputPath,
-      '-c:v', 'libx264',
-      '-preset', process.env.X264_PRESET || 'veryfast',
-      '-crf', process.env.X264_CRF || '22',
-      '-c:a', 'aac',
-      '-b:a', process.env.AAC_BITRATE || '128k',
-      '-movflags', '+faststart',
-      outputPath
-    ];
+    // Check if file is already web-optimized
+    console.log(`🔍 Checking if ${fileName} is web-optimized...`);
+    const validation = await checkWebOptimized(inputPath);
 
-    await runFfmpeg(ffArgs, requestId, videoDuration);
+    if (validation.optimized) {
+      console.log(`✅ File is already optimized: ${JSON.stringify(validation.videoInfo)}`);
+      console.log(`⚡ Skipping transcoding, uploading directly to IPFS`);
+      broadcastProgress(requestId, 50, 'optimized');
+      outputPath = inputPath; // Use original file
+      needsTranscoding = false;
+      videoDuration = validation.videoInfo?.duration || 0;
+    } else {
+      console.log(`⚠️  File needs transcoding: ${validation.reason}`);
+      needsTranscoding = true;
+      broadcastProgress(requestId, 10, 'transcoding');
+
+      const outName = `${uuidv4()}.mp4`;
+      outputPath = path.join(os.tmpdir(), outName);
+
+      // Get video duration for progress calculation
+      videoDuration = await getVideoDuration(inputPath);
+      console.log(`📏 Video duration: ${videoDuration}s`);
+
+      // Adaptive CRF based on duration and file size
+      let crf = process.env.X264_CRF || '22';
+      const durationMin = videoDuration / 60;
+      const sizeMB = fileSize / (1024 * 1024);
+
+      if (durationMin > 5 || sizeMB > 50) {
+        crf = '24'; // More compression for long/large videos
+        console.log(`📉 Using CRF 24 for large video (${durationMin.toFixed(1)}min, ${sizeMB.toFixed(1)}MB)`);
+      } else if (durationMin < 1) {
+        crf = '20'; // Better quality for short clips
+        console.log(`📈 Using CRF 20 for short video (${durationMin.toFixed(1)}min)`);
+      }
+
+      // Build FFmpeg args with optimizations
+      const ffArgs = [
+        '-y',
+        '-i', inputPath,
+        '-c:v', 'libx264',
+        '-preset', process.env.X264_PRESET || 'medium',
+        '-crf', crf,
+        '-vf', 'scale=min(iw\\,1920):min(ih\\,1080):force_original_aspect_ratio=decrease',
+        '-maxrate', '5M',
+        '-bufsize', '10M',
+        '-c:a', 'aac',
+        '-b:a', process.env.AAC_BITRATE || '128k',
+        '-movflags', '+faststart',
+        outputPath
+      ];
+
+      await runFfmpeg(ffArgs, requestId, videoDuration);
+    }
+
+    broadcastProgress(requestId, 80, 'uploading');
 
     // Upload to Pinata
     if (!PINATA_JWT) {
@@ -364,8 +483,9 @@ app.post('/transcode', upload.single('video'), async (req, res) => {
     const thumbnailRaw = (req.body?.thumbnail ?? req.body?.thumbnailUrl ?? '').toString().trim();
     const thumbnail = thumbnailRaw ? thumbnailRaw.slice(0, 2048) : '';
 
+    const uploadName = needsTranscoding ? path.basename(outputPath) : fileName;
     const form = new FormData();
-    form.append('file', fs.createReadStream(outputPath), { filename: outName, contentType: 'video/mp4' });
+    form.append('file', fs.createReadStream(outputPath), { filename: uploadName, contentType: 'video/mp4' });
 
     // Pinata metadata with rich keyvalues (standardized schema matching webapp)
     // NOTE: Pinata limits to max 10 keyvalues - prioritize most important fields
@@ -377,7 +497,7 @@ app.post('/transcode', upload.single('video'), async (req, res) => {
         creator,
         source: 'video-worker',
         uploadDate,
-        transcoded: 'true',
+        transcoded: needsTranscoding ? 'true' : 'passthrough',
         originalFileName: req.file.originalname,
         videoDuration: videoDuration ? videoDuration.toString() : 'unknown',
         requestId,
@@ -477,17 +597,21 @@ app.post('/transcode', upload.single('video'), async (req, res) => {
       timestamp: new Date().toISOString()
     });
   } finally {
-    // Cleanup
-    try {
-      fs.unlinkSync(inputPath);
-    } catch { }
-    try {
-      fs.unlinkSync(outputPath);
-    } catch { }
-    
+    // Cleanup - only delete transcoded file if different from input
+    try { fs.unlinkSync(inputPath); } catch { }
+    if (needsTranscoding && outputPath && outputPath !== inputPath) {
+      try { fs.unlinkSync(outputPath); } catch { }
+    }
+
     // Clean up job tracking after a delay (let SSE clients receive final state)
     setTimeout(() => {
-      activeJobs.delete(requestId);
+      if (activeJobs.has(requestId)) {
+        const job = activeJobs.get(requestId);
+        job?.clients?.forEach(client => {
+          try { client.end(); } catch { }
+        });
+        activeJobs.delete(requestId);
+      }
     }, 5000);
   }
 });
