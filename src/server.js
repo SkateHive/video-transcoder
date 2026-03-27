@@ -256,6 +256,90 @@ function parseDeviceInfo(userAgent, providedDeviceInfo) {
   return `${deviceType}/${os}/${browser}`;
 }
 
+/**
+ * Generate a JPEG thumbnail from a video file using FFmpeg.
+ * Captures a frame at 10% into the video (max 5s) and scales to max 640px.
+ * Returns the path to the thumbnail file, or null on failure.
+ */
+async function generateThumbnail(videoPath, videoDuration) {
+  const thumbPath = path.join(os.tmpdir(), `thumb-${uuidv4()}.jpg`);
+  // Capture at 10% of duration, capped at 5s, minimum 0.5s
+  const captureTime = Math.min(Math.max((videoDuration || 2) * 0.1, 0.5), 5);
+
+  return new Promise((resolve) => {
+    const proc = spawn('ffmpeg', [
+      '-y',
+      '-ss', String(captureTime),
+      '-i', videoPath,
+      '-frames:v', '1',
+      '-vf', 'scale=min(iw\\,640):min(ih\\,640):force_original_aspect_ratio=decrease',
+      '-q:v', '4', // JPEG quality (2-31, lower = better)
+      thumbPath
+    ]);
+
+    proc.on('close', (code) => {
+      if (code === 0 && fs.existsSync(thumbPath)) {
+        resolve(thumbPath);
+      } else {
+        resolve(null);
+      }
+    });
+
+    proc.on('error', () => resolve(null));
+  });
+}
+
+/**
+ * Upload a thumbnail to Pinata and return its gateway URL.
+ * Returns null if upload fails.
+ */
+async function uploadThumbnailToPinata(thumbPath, creator) {
+  if (!PINATA_JWT || !thumbPath) return null;
+
+  try {
+    const form = new FormData();
+    form.append('file', fs.createReadStream(thumbPath), {
+      filename: `${creator}-thumb-${Date.now()}.jpg`,
+      contentType: 'image/jpeg'
+    });
+
+    const metadata = {
+      name: `${creator}-thumbnail.jpg`,
+      keyvalues: {
+        creator,
+        source: 'video-worker',
+        fileType: 'thumbnail',
+        uploadDate: new Date().toISOString()
+      }
+    };
+    form.append('pinataMetadata', JSON.stringify(metadata));
+    form.append('pinataOptions', JSON.stringify({ cidVersion: 1 }));
+
+    const resp = await axios.post(
+      'https://api.pinata.cloud/pinning/pinFileToIPFS',
+      form,
+      {
+        headers: {
+          ...form.getHeaders(),
+          Authorization: `Bearer ${PINATA_JWT}`
+        },
+        maxContentLength: Infinity,
+        maxBodyLength: Infinity,
+        timeout: 30000
+      }
+    );
+
+    const { IpfsHash: cid } = resp.data;
+    return `${PINATA_GATEWAY.replace(/\/+$/, '')}/${cid}`;
+  } catch (err) {
+    console.warn(`⚠️ Thumbnail upload failed: ${err.message}`);
+    return null;
+  } finally {
+    // Cleanup thumbnail file
+    try { fs.unlinkSync(thumbPath); } catch {}
+  }
+}
+
 // Get video duration using ffprobe
 function getVideoDuration(inputPath) {
   return new Promise((resolve) => {
@@ -480,8 +564,22 @@ app.post('/transcode', upload.single('video'), async (req, res) => {
       throw new Error('PINATA_JWT not configured on server');
     }
 
+    // Resolve thumbnail: use client-provided one, or auto-generate from video
     const thumbnailRaw = (req.body?.thumbnail ?? req.body?.thumbnailUrl ?? '').toString().trim();
-    const thumbnail = thumbnailRaw ? thumbnailRaw.slice(0, 2048) : '';
+    let thumbnail = thumbnailRaw ? thumbnailRaw.slice(0, 2048) : '';
+
+    if (!thumbnail) {
+      // Auto-generate thumbnail from the video file
+      console.log(`🖼️ Auto-generating thumbnail for ${requestId}...`);
+      const thumbPath = await generateThumbnail(outputPath, videoDuration);
+      if (thumbPath) {
+        const thumbUrl = await uploadThumbnailToPinata(thumbPath, creator);
+        if (thumbUrl) {
+          thumbnail = thumbUrl;
+          console.log(`✅ Thumbnail generated and uploaded: ${thumbUrl}`);
+        }
+      }
+    }
 
     const uploadName = needsTranscoding ? path.basename(outputPath) : fileName;
     const form = new FormData();
