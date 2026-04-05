@@ -53,6 +53,14 @@ async function checkWebOptimized(inputPath) {
           return resolve({ optimized: false, reason: `resolution too high: ${height}p` });
         }
 
+        // yuv420p (8-bit 4:2:0) is required for universal mobile hardware decode.
+        // 10-bit formats (yuv420p10le, yuv422p10le, etc.) look like valid H.264 but
+        // fail on most mobile decoders.
+        const pixFmt = videoStream.pix_fmt;
+        if (pixFmt && pixFmt !== 'yuv420p') {
+          return resolve({ optimized: false, reason: `pixel format: ${pixFmt}` });
+        }
+
         resolve({
           optimized: true,
           videoInfo: {
@@ -548,6 +556,7 @@ app.post('/transcode', upload.single('video'), async (req, res) => {
         '-vf', 'scale=min(iw\\,1920):min(ih\\,1080):force_original_aspect_ratio=decrease',
         '-maxrate', '5M',
         '-bufsize', '10M',
+        '-pix_fmt', 'yuv420p', // 8-bit 4:2:0 — required for universal mobile hardware decode
         '-c:a', 'aac',
         '-b:a', process.env.AAC_BITRATE || '128k',
         '-movflags', '+faststart',
