@@ -11,8 +11,23 @@ import FormData from 'form-data';
 import { v4 as uuidv4 } from 'uuid';
 import TranscodeLogger from './logger.js';
 
+
 const app = express();
 const logger = new TranscodeLogger();
+
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'https://skatehive.app,http://localhost:3000,http://localhost:19006').split(',').map(s => s.trim()).filter(Boolean);
+const MOBILE_UPLOAD_TOKEN = process.env.MOBILE_UPLOAD_TOKEN || '';
+
+function getRequestAccess(req) {
+  const origin = req.get('Origin') || '';
+  const mobileToken = req.get('X-Skatehive-Upload-Key') || '';
+  const clientType = req.get('X-Skatehive-Client') || '';
+  const hasAllowedOrigin = !!origin && ALLOWED_ORIGINS.includes(origin);
+  const isMobileTokenValid = !!MOBILE_UPLOAD_TOKEN && mobileToken === MOBILE_UPLOAD_TOKEN;
+  const isOriginlessRequest = !origin; // native mobile / server-to-server often send no Origin
+  const allowed = hasAllowedOrigin || isMobileTokenValid || isOriginlessRequest;
+  return { allowed, origin, hasAllowedOrigin, isMobileTokenValid, isOriginlessRequest, clientType };
+}
 
 /**
  * Check if video is web-optimized (H.264/AAC, faststart, reasonable size)
@@ -80,19 +95,24 @@ async function checkWebOptimized(inputPath) {
 // Store active transcoding progress for SSE clients
 const activeJobs = new Map(); // requestId -> { progress, stage, clients: Set<Response> }
 
-// Enhanced CORS setup for web application compatibility
-// --- CORS configuration ---
-// Allow requests from any origin
-
-// Additional CORS headers for maximum compatibility
+// Restrictive CORS: allow Skatehive web origins, native/mobile token, and originless app/server calls
 app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS,PUT,DELETE');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept,X-Requested-With');
-  res.setHeader('Access-Control-Max-Age', '86400'); // 24 hours
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(204);
+  const access = getRequestAccess(req);
+
+  if (access.hasAllowedOrigin) {
+    res.setHeader('Access-Control-Allow-Origin', access.origin);
+    res.setHeader('Vary', 'Origin');
   }
+
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept,X-Requested-With,X-Skatehive-Client,X-Skatehive-Platform,X-Skatehive-App-Version,X-Skatehive-Upload-Key');
+  res.setHeader('Access-Control-Max-Age', '86400');
+
+  if (req.method === 'OPTIONS') {
+    return access.allowed ? res.sendStatus(204) : res.status(403).json({ ok: false, error: 'Origin not allowed' });
+  }
+
+  req.skatehiveAccess = access;
   next();
 });
 
@@ -176,7 +196,10 @@ app.get('/progress/:requestId', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  if ((req.skatehiveAccess || getRequestAccess(req)).hasAllowedOrigin) {
+    res.setHeader('Access-Control-Allow-Origin', (req.skatehiveAccess || getRequestAccess(req)).origin);
+    res.setHeader('Vary', 'Origin');
+  }
   res.flushHeaders();
 
   // Create job entry if doesn't exist
@@ -422,6 +445,11 @@ function runFfmpeg(args, requestId = 'unknown', totalDuration = 0) {
 
 // POST /transcode  (multipart form fields: video [required], creator [optional], thumbnail [optional], platform [optional], deviceInfo [optional])
 app.post('/transcode', upload.single('video'), async (req, res) => {
+  const access = req.skatehiveAccess || getRequestAccess(req);
+  if (!access.allowed) {
+    return res.status(403).json({ ok: false, error: 'Request origin not allowed' });
+  }
+
   const internalId = uuidv4().substring(0, 8); // Short ID for internal logging
   const startTime = Date.now();
   const clientIP = req.ip || req.connection.remoteAddress || 'unknown';
