@@ -623,25 +623,24 @@ app.post('/transcode', upload.single('video'), async (req, res) => {
     form.append('file', fs.createReadStream(outputPath), { filename: uploadName, contentType: 'video/mp4' });
 
     // Pinata metadata with rich keyvalues (standardized schema matching webapp)
-    // NOTE: Pinata limits to max 10 keyvalues - prioritize most important fields
+    // PINATA HARD LIMIT: max 10 keyvalues — keep to 9 for safety
     const uploadDate = new Date().toISOString();
+    const keyvalues = {
+      creator,
+      source: 'video-worker',
+      uploadDate,
+      transcoded: needsTranscoding ? 'true' : 'passthrough',
+      originalFileName: req.file.originalname,
+      videoDuration: videoDuration ? videoDuration.toString() : 'unknown',
+      ...(sourceApp && { sourceApp }),
+      ...(platform && { platform }),
+      ...(thumbnail && { thumbnailUrl: thumbnail })
+    };
+    // Enforce max 9 keyvalues (Pinata rejects >10, be safe)
+    const trimmedKeyvalues = Object.fromEntries(Object.entries(keyvalues).slice(0, 9));
     const metadata = {
       name: `${creator}-${uploadDate}.mp4`,
-      keyvalues: {
-        // Core identity (webapp-compatible) - 7 fields
-        creator,
-        source: 'video-worker',
-        uploadDate,
-        transcoded: needsTranscoding ? 'true' : 'passthrough',
-        originalFileName: req.file.originalname,
-        videoDuration: videoDuration ? videoDuration.toString() : 'unknown',
-        requestId,
-        
-        // Device/platform tracking - up to 3 more fields (10 total max)
-        ...(sourceApp && { sourceApp }),  // webapp/mobile
-        ...(platform && { platform }),    // mobile/desktop
-        ...(thumbnail && { thumbnailUrl: thumbnail })
-      }
+      keyvalues: trimmedKeyvalues
     };
     form.append('pinataMetadata', JSON.stringify(metadata));
 
