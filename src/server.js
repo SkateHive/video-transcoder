@@ -652,25 +652,46 @@ app.post('/transcode', upload.single('video'), async (req, res) => {
 
     broadcastProgress(requestId, 85, 'uploading');
 
-    const resp = await axios.post(
-      'https://api.pinata.cloud/pinning/pinFileToIPFS',
-      form,
-      {
-        headers: {
-          ...form.getHeaders(),
-          Authorization: `Bearer ${PINATA_JWT}`
-        },
-        maxContentLength: Infinity,
-        maxBodyLength: Infinity,
-        onUploadProgress: (progressEvent) => {
-          // Calculate upload progress (85-100% range)
-          if (progressEvent.total) {
-            const uploadPercent = Math.round((progressEvent.loaded / progressEvent.total) * 15);
-            broadcastProgress(requestId, 85 + uploadPercent, 'uploading');
+    // Upload to Pinata with retry logic (Pinata can return transient 400s)
+    let resp;
+    const MAX_PINATA_RETRIES = 3;
+    for (let attempt = 1; attempt <= MAX_PINATA_RETRIES; attempt++) {
+      try {
+        // Rebuild form on retry (stream already consumed on previous attempt)
+        const retryForm = new FormData();
+        retryForm.append('file', fs.createReadStream(outputPath), { filename: uploadName, contentType: 'video/mp4' });
+        retryForm.append('pinataMetadata', JSON.stringify(metadata));
+        retryForm.append('pinataOptions', JSON.stringify(options));
+
+        resp = await axios.post(
+          'https://api.pinata.cloud/pinning/pinFileToIPFS',
+          retryForm,
+          {
+            headers: {
+              ...retryForm.getHeaders(),
+              Authorization: `Bearer ${PINATA_JWT}`
+            },
+            maxContentLength: Infinity,
+            maxBodyLength: Infinity,
+            onUploadProgress: (progressEvent) => {
+              if (progressEvent.total) {
+                const uploadPercent = Math.round((progressEvent.loaded / progressEvent.total) * 15);
+                broadcastProgress(requestId, 85 + uploadPercent, 'uploading');
+              }
+            }
           }
-        }
+        );
+        break; // success
+      } catch (pinataErr) {
+        const status = pinataErr.response?.status;
+        const detail = JSON.stringify(pinataErr.response?.data || pinataErr.message);
+        console.error(`❌ [PINATA] Attempt ${attempt}/${MAX_PINATA_RETRIES} failed — HTTP ${status}: ${detail}`);
+        if (attempt === MAX_PINATA_RETRIES) throw pinataErr;
+        // Wait before retrying: 2s, 4s
+        await new Promise(r => setTimeout(r, attempt * 2000));
+        broadcastProgress(requestId, 85, `uploading_retry_${attempt}`);
       }
-    );
+    }
 
     const { IpfsHash: cid } = resp.data;
     const gatewayUrl = `${PINATA_GATEWAY.replace(/\/+$/, '')}/${cid}`;
@@ -707,12 +728,8 @@ app.post('/transcode', upload.single('video'), async (req, res) => {
     broadcastProgress(requestId, 0, 'error');
 
     // Enhanced error logging for debugging Pinata issues
-    console.error('❌ [PINATA-ERROR] Full error details:', {
-      message: err.message,
-      response: err.response?.data,
-      status: err.response?.status,
-      headers: err.response?.headers
-    });
+    const pinataDetail = err.response?.data ? JSON.stringify(err.response.data) : err.message;
+    console.error(`❌ [PINATA-ERROR] HTTP ${err.response?.status || 'N/A'}: ${pinataDetail}`);
 
     // Log error
     logger.logTranscodeError({
