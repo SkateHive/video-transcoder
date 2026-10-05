@@ -8,8 +8,19 @@ import os from 'os';
 import morgan from 'morgan';
 import axios from 'axios';
 import FormData from 'form-data';
+import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import TranscodeLogger from './logger.js';
+
+// Constant-time shared-secret comparison — a plain !== leaks timing
+// information proportional to how many leading characters match, letting an
+// attacker recover the secret byte-by-byte over enough requests.
+function timingSafeEqualSecret(provided, expected) {
+  const providedBuf = Buffer.from(String(provided || ''));
+  const expectedBuf = Buffer.from(String(expected || ''));
+  if (providedBuf.length !== expectedBuf.length) return false;
+  return crypto.timingSafeEqual(providedBuf, expectedBuf);
+}
 
 
 const app = express();
@@ -138,6 +149,16 @@ const activeProcessingJobs = new Map(); // requestId -> { startedAt, filename, s
 const MAX_CONCURRENT_JOBS = Number.parseInt(process.env.MAX_CONCURRENT_JOBS || process.env.MAX_CONCURRENT_TRANSCODES || '1', 10);
 const FFMPEG_TIMEOUT_MS = Number.parseInt(process.env.FFMPEG_TIMEOUT_MS || String(10 * 60 * 1000), 10);
 
+// F3: thumbnail-by-CID jobs get their own capacity of 1, entirely separate
+// from activeProcessingJobs, so a burst of thumbnail requests can never
+// starve (or be starved by) real /transcode uploads.
+const activeThumbnailJobs = new Set(); // cid -> in progress
+
+// Spotmap images: image-thumbnail jobs get their own capacity of 1 too,
+// separate from both /transcode and /thumbnail — a burst of spotmap admin
+// edits (or the backfill script) can't starve or be starved by either.
+const activeImageThumbnailJobs = new Set(); // source url -> in progress
+
 function getCapacity() {
   return {
     active: activeProcessingJobs.size,
@@ -206,6 +227,66 @@ const PORT = process.env.PORT || 8080;
 const PINATA_JWT = process.env.PINATA_JWT;
 const PINATA_GATEWAY = process.env.PINATA_GATEWAY || 'https://ipfs.skatehive.app/ipfs';
 const PINATA_GROUP_VIDEOS = process.env.PINATA_GROUP_VIDEOS || null;
+// F3 (server-side thumbnails): shared secret guarding POST /thumbnail. The
+// caller (skatehive-api) must send the same value as x-thumbnail-secret.
+const THUMBNAIL_SHARED_SECRET = process.env.THUMBNAIL_SHARED_SECRET || '';
+const THUMBNAIL_FETCH_TIMEOUT_MS = Number.parseInt(process.env.THUMBNAIL_FETCH_TIMEOUT_MS || '60000', 10);
+// Spotmap images: same shared secret as POST /thumbnail (THUMBNAIL_SHARED_SECRET) —
+// one secret guards both server-to-server thumbnail endpoints.
+const IMAGE_THUMBNAIL_TIMEOUT_MS = Number.parseInt(process.env.IMAGE_THUMBNAIL_TIMEOUT_MS || '60000', 10);
+// A non-numeric value parses to NaN, and `received > NaN` is always false —
+// the download cap would silently vanish. Fall back to 25 MB instead.
+const IMAGE_THUMBNAIL_MAX_BYTES = (() => {
+  const n = Number.parseInt(process.env.IMAGE_THUMBNAIL_MAX_BYTES || '', 10);
+  return Number.isFinite(n) && n > 0 ? n : 25 * 1024 * 1024;
+})();
+// SSRF mitigation: an allow-list, not a deny-list — reject every host that
+// isn't one of these before making any network call, rather than trying to
+// enumerate every private/internal address to block. Mirrors
+// IMAGE_THUMBNAIL_ALLOWED_HOSTS on skatehive-api (src/lib/spotmap-thumbnails.ts);
+// keep the two in sync by setting the SAME value in both services' env, not
+// just one. To extend: add the host here (comma-separated) and there.
+const IMAGE_THUMBNAIL_ALLOWED_HOSTS = (
+  process.env.IMAGE_THUMBNAIL_ALLOWED_HOSTS ||
+  'images.hive.blog,files.peakd.com,mymaps.usercontent.google.com,lh3.googleusercontent.com,ipfs.skatehive.app'
+).split(',').map(h => h.trim().toLowerCase()).filter(Boolean);
+
+function isAllowedImageThumbnailUrl(rawUrl) {
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'https:') return false;
+  return IMAGE_THUMBNAIL_ALLOWED_HOSTS.includes(parsed.hostname.toLowerCase());
+}
+
+// JPEG/PNG/WebP/GIF magic-byte signatures. Checked against the downloaded
+// file before it ever reaches ffmpeg — an allow-listed host is trusted to be
+// the right HOST, not to only ever serve images (or to not have been
+// compromised), so the content itself still gets verified.
+function sniffImageMagicBytes(filePath) {
+  let fd;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    const buf = Buffer.alloc(12);
+    const bytesRead = fs.readSync(fd, buf, 0, 12, 0);
+    if (bytesRead >= 3 && buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) return true; // JPEG
+    if (bytesRead >= 4 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47) return true; // PNG
+    if (bytesRead >= 4 && buf.toString('ascii', 0, 4) === 'GIF8') return true; // GIF
+    if (bytesRead >= 12 && buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') return true; // WebP
+    return false;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) { try { fs.closeSync(fd); } catch {} }
+  }
+}
+
+if (!THUMBNAIL_SHARED_SECRET) {
+  console.warn('⚠️  THUMBNAIL_SHARED_SECRET is not set — POST /thumbnail and POST /image-thumbnail will reject every request.');
+}
 
 if (!PINATA_JWT) {
   console.warn('⚠️  PINATA_JWT is not set. Set it in your environment before starting.');
@@ -250,9 +331,137 @@ app.get('/healthz', (req, res) => {
       active: capacity.active,
       max: capacity.max,
       available: capacity.available
+    },
+    thumbnailCapacity: {
+      active: activeThumbnailJobs.size,
+      max: 1,
+      available: activeThumbnailJobs.size >= 1 ? 0 : 1
+    },
+    imageThumbnailCapacity: {
+      active: activeImageThumbnailJobs.size,
+      max: 1,
+      available: activeImageThumbnailJobs.size >= 1 ? 0 : 1
     }
   };
   sendHealth(req, res, payload, 'Video Worker Health');
+});
+
+// F3 (server-side thumbnails): given a CID, grab a frame straight off the
+// IPFS gateway and pin it. Guarded by a shared secret (not the CORS/origin
+// gate above) since this is a server-to-server call from skatehive-api, not
+// a browser/app upload. Its own capacity of 1, separate from /transcode.
+app.post('/thumbnail', express.json(), async (req, res) => {
+  const provided = req.get('x-thumbnail-secret') || '';
+  if (!THUMBNAIL_SHARED_SECRET || !timingSafeEqualSecret(provided, THUMBNAIL_SHARED_SECRET)) {
+    return res.status(401).json({ ok: false, error: 'Unauthorized' });
+  }
+
+  const cid = String(req.body?.cid || '').trim();
+  if (!cid || !/^[a-zA-Z0-9]+$/.test(cid)) {
+    return res.status(400).json({ ok: false, error: 'Missing or invalid cid' });
+  }
+
+  if (activeThumbnailJobs.size >= 1) {
+    return res.status(503).json({ ok: false, error: 'Thumbnail worker busy, try again shortly', cid });
+  }
+
+  activeThumbnailJobs.add(cid);
+  const startTime = Date.now();
+  let thumbPath = null;
+  try {
+    const gatewayUrl = `${PINATA_GATEWAY.replace(/\/+$/, '')}/${cid}`;
+    thumbPath = await generateThumbnail(gatewayUrl, undefined, {
+      captureTime: 1,
+      timeoutMs: THUMBNAIL_FETCH_TIMEOUT_MS
+    });
+    if (!thumbPath) {
+      console.warn(`⚠️ Thumbnail generation failed for ${cid} (gateway didn't serve it in time, or ffmpeg failed)`);
+      return res.status(404).json({ ok: false, error: 'Could not generate a thumbnail for this CID', cid });
+    }
+
+    const thumbnailUrl = await uploadThumbnailToPinata(thumbPath, cid);
+    thumbPath = null; // uploadThumbnailToPinata always cleans up the file itself, success or failure
+
+    if (!thumbnailUrl) {
+      return res.status(502).json({ ok: false, error: 'Thumbnail generated but the Pinata upload failed', cid });
+    }
+
+    console.log(`✅ Thumbnail ready for ${cid} in ${Date.now() - startTime}ms`);
+    return res.json({ cid, thumbnailUrl });
+  } catch (err) {
+    console.error(`⚠️ Thumbnail job failed for ${cid}:`, err.message || err);
+    return res.status(500).json({ ok: false, error: 'Thumbnail job failed', cid });
+  } finally {
+    activeThumbnailJobs.delete(cid);
+    if (thumbPath) { try { fs.unlinkSync(thumbPath); } catch {} }
+  }
+});
+
+// Spotmap images: downscale an arbitrary image URL (Google My Maps
+// hostedimage URLs mainly — they accept no size parameter and 400 if you add
+// one, unlike images.hive.blog, which resizes those for free and never needs
+// this endpoint). Same shared-secret auth as POST /thumbnail, own capacity
+// of 1, 60s timeout covering both the download and the ffmpeg step.
+app.post('/image-thumbnail', express.json(), async (req, res) => {
+  const provided = req.get('x-thumbnail-secret') || '';
+  if (!THUMBNAIL_SHARED_SECRET || !timingSafeEqualSecret(provided, THUMBNAIL_SHARED_SECRET)) {
+    return res.status(401).json({ ok: false, error: 'Unauthorized' });
+  }
+
+  const sourceUrl = String(req.body?.url || '').trim();
+  if (!sourceUrl || !isAllowedImageThumbnailUrl(sourceUrl)) {
+    // Rejected before any network call — SSRF allow-list, not a deny-list:
+    // only https URLs on IMAGE_THUMBNAIL_ALLOWED_HOSTS get past this point.
+    return res.status(400).json({ ok: false, error: 'url must be https and on the allowed host list' });
+  }
+  const requestedMaxPx = Number(req.body?.maxPx);
+  const maxPx = Number.isFinite(requestedMaxPx) && requestedMaxPx > 0
+    ? Math.min(Math.round(requestedMaxPx), 1000)
+    : 400;
+
+  if (activeImageThumbnailJobs.size >= 1) {
+    return res.status(503).json({ ok: false, error: 'Image thumbnail worker busy, try again shortly', url: sourceUrl });
+  }
+
+  activeImageThumbnailJobs.add(sourceUrl);
+  const startTime = Date.now();
+  let downloadedPath = null;
+  let thumbPath = null;
+  try {
+    downloadedPath = await downloadToTempFile(sourceUrl, IMAGE_THUMBNAIL_TIMEOUT_MS, IMAGE_THUMBNAIL_MAX_BYTES);
+    if (!downloadedPath) {
+      console.warn(`⚠️ Image download failed for ${sourceUrl}`);
+      return res.status(404).json({ ok: false, error: 'Could not download this image', url: sourceUrl });
+    }
+
+    if (!sniffImageMagicBytes(downloadedPath)) {
+      console.warn(`⚠️ Downloaded content is not a recognized image format: ${sourceUrl}`);
+      return res.status(400).json({ ok: false, error: 'Downloaded content is not a recognized image format', url: sourceUrl });
+    }
+
+    thumbPath = await generateImageThumbnail(downloadedPath, maxPx, IMAGE_THUMBNAIL_TIMEOUT_MS);
+    if (!thumbPath) {
+      console.warn(`⚠️ Image thumbnail generation failed for ${sourceUrl}`);
+      return res.status(404).json({ ok: false, error: 'Could not generate a thumbnail for this image', url: sourceUrl });
+    }
+
+    const thumbnailUrl = await uploadThumbnailToPinata(thumbPath, 'spotmap');
+    thumbPath = null; // uploadThumbnailToPinata always cleans up the file itself, success or failure
+
+    if (!thumbnailUrl) {
+      return res.status(502).json({ ok: false, error: 'Thumbnail generated but the Pinata upload failed', url: sourceUrl });
+    }
+
+    console.log(`✅ Image thumbnail ready for ${sourceUrl} in ${Date.now() - startTime}ms`);
+    return res.json({ url: thumbnailUrl });
+  } catch (err) {
+    console.error(`⚠️ Image thumbnail job failed for ${sourceUrl}:`, err.message || err);
+    return res.status(500).json({ ok: false, error: 'Image thumbnail job failed', url: sourceUrl });
+  } finally {
+    activeImageThumbnailJobs.delete(sourceUrl);
+    if (downloadedPath) { try { fs.unlinkSync(downloadedPath); } catch {} }
+    if (thumbPath) { try { fs.unlinkSync(thumbPath); } catch {} }
+  }
 });
 
 // SSE endpoint for progress streaming
@@ -371,10 +580,14 @@ function parseDeviceInfo(userAgent, providedDeviceInfo) {
  * Captures a frame at 10% into the video (max 5s) and scales to max 640px.
  * Returns the path to the thumbnail file, or null on failure.
  */
-async function generateThumbnail(videoPath, videoDuration) {
+async function generateThumbnail(videoPath, videoDuration, opts = {}) {
   const thumbPath = path.join(os.tmpdir(), `thumb-${uuidv4()}.jpg`);
-  // Capture at 10% of duration, capped at 5s, minimum 0.5s
-  const captureTime = Math.min(Math.max((videoDuration || 2) * 0.1, 0.5), 5);
+  // Capture at 10% of duration, capped at 5s, minimum 0.5s — unless the
+  // caller (F3's /thumbnail route, which has no duration up front) passes a
+  // fixed captureTime instead.
+  const captureTime = opts.captureTime != null
+    ? opts.captureTime
+    : Math.min(Math.max((videoDuration || 2) * 0.1, 0.5), 5);
 
   return new Promise((resolve) => {
     const proc = spawn('ffmpeg', [
@@ -387,15 +600,28 @@ async function generateThumbnail(videoPath, videoDuration) {
       thumbPath
     ]);
 
+    let timedOut = false;
+    const timeoutId = opts.timeoutMs
+      ? setTimeout(() => {
+          timedOut = true;
+          proc.kill('SIGKILL');
+        }, opts.timeoutMs)
+      : null;
+
     proc.on('close', (code) => {
-      if (code === 0 && fs.existsSync(thumbPath)) {
+      if (timeoutId) clearTimeout(timeoutId);
+      if (!timedOut && code === 0 && fs.existsSync(thumbPath)) {
         resolve(thumbPath);
       } else {
+        try { fs.unlinkSync(thumbPath); } catch {}
         resolve(null);
       }
     });
 
-    proc.on('error', () => resolve(null));
+    proc.on('error', () => {
+      if (timeoutId) clearTimeout(timeoutId);
+      resolve(null);
+    });
   });
 }
 
@@ -448,6 +674,118 @@ async function uploadThumbnailToPinata(thumbPath, creator) {
     // Cleanup thumbnail file
     try { fs.unlinkSync(thumbPath); } catch {}
   }
+}
+
+/**
+ * Download an arbitrary (allow-listed) image URL to a temp file. Used by
+ * POST /image-thumbnail for sources ffmpeg can't be trusted to fetch
+ * directly (Google My Maps hostedimage URLs etc. — unlike POST /thumbnail,
+ * which hands ffmpeg a known-good Pinata gateway URL straight up).
+ * Returns the temp file path, or null on any failure.
+ *
+ * Two independent size/time guards beyond axios's own options, since axios
+ * does NOT enforce maxContentLength/maxBodyLength for responseType:'stream'
+ * (those only apply when axios buffers the response itself):
+ *  - byte count is tallied on every 'data' chunk and the stream is destroyed
+ *    the moment it crosses the cap, instead of trusting the response to stop.
+ *  - a wall-clock AbortController deadline fires regardless of ongoing
+ *    trickle activity, in addition to axios's `timeout` (which is closer to
+ *    an idle/inactivity timeout) — a slow-loris style drip feed could
+ *    otherwise stall the request indefinitely without ever going idle.
+ * maxRedirects: 0 — a redirect is treated as a failure, not followed; the
+ * allow-list check happened against the ORIGINAL url, and a redirect target
+ * could point anywhere.
+ */
+async function downloadToTempFile(url, timeoutMs, maxBytes) {
+  const destPath = path.join(os.tmpdir(), `spot-img-${uuidv4()}`);
+  const controller = new AbortController();
+  const deadline = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await axios.get(url, {
+      responseType: 'stream',
+      timeout: timeoutMs,
+      maxRedirects: 0,
+      signal: controller.signal,
+      headers: { 'user-agent': 'skatehive-transcoder-image-thumb/1.0' }
+    });
+    let received = 0;
+    let overLimit = false;
+    await new Promise((resolve, reject) => {
+      const writer = fs.createWriteStream(destPath);
+      response.data.on('data', (chunk) => {
+        received += chunk.length;
+        if (received > maxBytes && !overLimit) {
+          overLimit = true;
+          response.data.destroy(new Error('Response exceeds max allowed size'));
+          writer.destroy();
+        }
+      });
+      response.data.pipe(writer);
+      writer.on('finish', () => { if (!overLimit) resolve(); });
+      writer.on('error', reject);
+      response.data.on('error', reject);
+    });
+    return destPath;
+  } catch (err) {
+    try { fs.unlinkSync(destPath); } catch {}
+    return null;
+  } finally {
+    clearTimeout(deadline);
+  }
+}
+
+/**
+ * Downscale a still image so neither side exceeds maxPx (aspect
+ * preserved, never upscaled) and re-encode as JPEG — one frame, no seeking (unlike
+ * generateThumbnail, which is video-specific: -ss + duration-based capture
+ * time). Returns the path to the thumbnail file, or null on failure/timeout.
+ *
+ * -nostdin: never wait on stdin (this runs unattended). -f image2
+ * -protocol_whitelist file: input is a local file we just downloaded and
+ * magic-byte-sniffed ourselves — this forbids ffmpeg from being tricked into
+ * opening anything else (a URL, a pipe) even if imagePath were ever
+ * attacker-influenced.
+ */
+async function generateImageThumbnail(imagePath, maxPx, timeoutMs) {
+  const thumbPath = path.join(os.tmpdir(), `img-thumb-${uuidv4()}.jpg`);
+
+  return new Promise((resolve) => {
+    const proc = spawn('ffmpeg', [
+      '-y',
+      '-nostdin',
+      '-f', 'image2',
+      '-protocol_whitelist', 'file',
+      '-i', imagePath,
+      // Bound BOTH sides: width-only let a portrait photo come out 400x1066.
+      '-vf', `scale=w='min(${maxPx},iw)':h='min(${maxPx},ih)':force_original_aspect_ratio=decrease`,
+      '-frames:v', '1',
+      '-q:v', '4',
+      thumbPath
+    ]);
+
+    let timedOut = false;
+    const timeoutId = timeoutMs
+      ? setTimeout(() => {
+          timedOut = true;
+          proc.kill('SIGKILL');
+        }, timeoutMs)
+      : null;
+
+    proc.on('close', (code) => {
+      if (timeoutId) clearTimeout(timeoutId);
+      if (!timedOut && code === 0 && fs.existsSync(thumbPath)) {
+        resolve(thumbPath);
+      } else {
+        try { fs.unlinkSync(thumbPath); } catch {}
+        resolve(null);
+      }
+    });
+
+    proc.on('error', () => {
+      if (timeoutId) clearTimeout(timeoutId);
+      resolve(null);
+    });
+  });
 }
 
 // Get video duration using ffprobe
