@@ -95,7 +95,7 @@ accept no size parameter and 400 if you add one.
   ever sees it — an allow-listed host is trusted to be the right *host*, not
   to only ever serve images.
 - `ffmpeg -nostdin -f image2 -protocol_whitelist file -i <file> -vf
-  "scale='min(maxPx,iw)':-2" -frames:v 1` to JPEG — the protocol whitelist
+  "scale=w='min(maxPx,iw)':h='min(maxPx,ih)':force_original_aspect_ratio=decrease" -frames:v 1` to JPEG — the protocol whitelist
   keeps ffmpeg confined to reading the local file we already validated.
 
 **Request**

@@ -234,7 +234,12 @@ const THUMBNAIL_FETCH_TIMEOUT_MS = Number.parseInt(process.env.THUMBNAIL_FETCH_T
 // Spotmap images: same shared secret as POST /thumbnail (THUMBNAIL_SHARED_SECRET) —
 // one secret guards both server-to-server thumbnail endpoints.
 const IMAGE_THUMBNAIL_TIMEOUT_MS = Number.parseInt(process.env.IMAGE_THUMBNAIL_TIMEOUT_MS || '60000', 10);
-const IMAGE_THUMBNAIL_MAX_BYTES = Number.parseInt(process.env.IMAGE_THUMBNAIL_MAX_BYTES || String(25 * 1024 * 1024), 10);
+// A non-numeric value parses to NaN, and `received > NaN` is always false —
+// the download cap would silently vanish. Fall back to 25 MB instead.
+const IMAGE_THUMBNAIL_MAX_BYTES = (() => {
+  const n = Number.parseInt(process.env.IMAGE_THUMBNAIL_MAX_BYTES || '', 10);
+  return Number.isFinite(n) && n > 0 ? n : 25 * 1024 * 1024;
+})();
 // SSRF mitigation: an allow-list, not a deny-list — reject every host that
 // isn't one of these before making any network call, rather than trying to
 // enumerate every private/internal address to block. Mirrors
@@ -730,8 +735,8 @@ async function downloadToTempFile(url, timeoutMs, maxBytes) {
 }
 
 /**
- * Downscale a still image to at most maxPx wide (height auto, aspect
- * preserved) and re-encode as JPEG — one frame, no seeking (unlike
+ * Downscale a still image so neither side exceeds maxPx (aspect
+ * preserved, never upscaled) and re-encode as JPEG — one frame, no seeking (unlike
  * generateThumbnail, which is video-specific: -ss + duration-based capture
  * time). Returns the path to the thumbnail file, or null on failure/timeout.
  *
@@ -751,7 +756,8 @@ async function generateImageThumbnail(imagePath, maxPx, timeoutMs) {
       '-f', 'image2',
       '-protocol_whitelist', 'file',
       '-i', imagePath,
-      '-vf', `scale='min(${maxPx},iw)':-2`,
+      // Bound BOTH sides: width-only let a portrait photo come out 400x1066.
+      '-vf', `scale=w='min(${maxPx},iw)':h='min(${maxPx},ih)':force_original_aspect_ratio=decrease`,
       '-frames:v', '1',
       '-q:v', '4',
       thumbPath
